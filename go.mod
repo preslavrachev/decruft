@@ -5,6 +5,7 @@ go 1.25.7
 require (
 	github.com/PuerkitoBio/goquery v1.11.0
 	github.com/gocolly/colly/v2 v2.3.0
+	github.com/urfave/cli/v3 v3.10.1
 	golang.org/x/net v0.53.0
 )
 

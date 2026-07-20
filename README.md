@@ -14,11 +14,40 @@ affiliated with the original Defuddle project.
 
 ## Installation
 
+Install the CLI:
+
+```bash
+go install github.com/preslavrachev/decruft/cmd/decruft@latest
+```
+
+Or add the library to a Go module:
+
 ```bash
 go get github.com/preslavrachev/decruft
 ```
 
-## Usage
+## CLI
+
+The initial CLI intentionally mirrors the small part of Defuddle's command
+surface used for local URL inspection:
+
+```bash
+decruft parse https://example.com/article --markdown
+```
+
+`--md` is available as a shorter alias:
+
+```bash
+decruft parse https://example.com/article --md
+```
+
+Markdown output includes the extracted title as a heading followed by the
+readable content. Without `--markdown`, the command prints plain text.
+
+The CLI currently accepts one URL at a time. It does not yet parse local files,
+read HTML from standard input, emit JSON, or execute page JavaScript.
+
+## Library usage
 
 ```go
 package main
@@ -96,7 +125,7 @@ address policy before calling `Fetch`.
 
 ## Current scope
 
-- The output is plain text, not cleaned HTML or Markdown.
+- The library output is plain text. The CLI can wrap it as basic Markdown.
 - Pages are parsed from their HTTP response and JavaScript is not executed.
 - Extraction is heuristic and may need site-specific regression fixes.
 - The default fetcher has a 10-second request timeout.
