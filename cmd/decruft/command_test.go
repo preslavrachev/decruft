@@ -56,6 +56,37 @@ func TestParseMarkdownAlias(t *testing.T) {
 	}
 }
 
+func TestParsePlainTitleOnly(t *testing.T) {
+	fetcher := &fakeFetcher{
+		result: &decruft.Result{Title: "Example article"},
+	}
+	var stdout bytes.Buffer
+
+	err := newCommand(fetcher, &stdout, io.Discard).Run(
+		context.Background(),
+		[]string{"decruft", "parse", "https://example.com/article"},
+	)
+	if err != nil {
+		t.Fatalf("run command: %v", err)
+	}
+
+	if stdout.String() != "Example article\n" {
+		t.Fatalf("output: got %q", stdout.String())
+	}
+}
+
+func TestParseReportsNoContent(t *testing.T) {
+	fetcher := &fakeFetcher{result: &decruft.Result{}}
+
+	err := newCommand(fetcher, io.Discard, io.Discard).Run(
+		context.Background(),
+		[]string{"decruft", "parse", "https://example.com/article"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "no readable content found") {
+		t.Fatalf("error: got %v", err)
+	}
+}
+
 func TestParseRequiresOneURL(t *testing.T) {
 	err := newCommand(&fakeFetcher{}, io.Discard, io.Discard).Run(
 		context.Background(),
