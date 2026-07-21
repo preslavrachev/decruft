@@ -13,24 +13,26 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/gocolly/colly/v2"
 )
 
-func TestNewConfiguresDefaultCollector(t *testing.T) {
+func TestNewConfiguresDefaults(t *testing.T) {
 	fetcher := New()
 
-	if fetcher.collector.MaxDepth != 1 {
-		t.Fatalf("max depth: got %d, want 1", fetcher.collector.MaxDepth)
+	if fetcher.config.maxBodySize != defaultMaxBodySize {
+		t.Fatalf("body limit: got %d, want %d", fetcher.config.maxBodySize, defaultMaxBodySize)
 	}
-	if !fetcher.collector.Async {
-		t.Fatal("expected asynchronous collector")
+	if fetcher.config.timeout != defaultTimeout {
+		t.Fatalf("timeout: got %s, want %s", fetcher.config.timeout, defaultTimeout)
 	}
-	if !fetcher.collector.AllowURLRevisit {
-		t.Fatal("expected URL revisits to be allowed")
+	if fetcher.config.maxRetries != 1 {
+		t.Fatalf("retries: got %d, want 1", fetcher.config.maxRetries)
 	}
-	if fetcher.collector.UserAgent != "Mozilla/5.0 (compatible; Decruft/1.0)" {
-		t.Fatalf("user agent: got %q", fetcher.collector.UserAgent)
+	if cap(fetcher.slots) != 3 {
+		t.Fatalf("parallelism: got %d, want 3", cap(fetcher.slots))
+	}
+	localized := NewWithOptions(WithLanguage("bg"))
+	if localized.config.language != "bg" {
+		t.Fatalf("language: got %q, want %q", localized.config.language, "bg")
 	}
 }
 
@@ -82,13 +84,8 @@ func TestFetchSuccess(t *testing.T) {
 	}
 }
 
-func TestFetchReturnsCurrentHTTPStatusErrors(t *testing.T) {
-	for _, status := range []int{
-		http.StatusNonAuthoritativeInfo,
-		http.StatusNoContent,
-		http.StatusNotFound,
-		http.StatusInternalServerError,
-	} {
+func TestFetchReturnsHTTPStatusErrors(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusInternalServerError} {
 		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
 			fetcher := newTestFetcher(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				return htmlResponse(req, status, `<html><head><title>Status response</title></head></html>`), nil
@@ -99,6 +96,20 @@ func TestFetchReturnsCurrentHTTPStatusErrors(t *testing.T) {
 				t.Fatalf("error: got %v, want HTTP %d", err, status)
 			}
 		})
+	}
+}
+
+func TestFetchAcceptsSuccessfulHTTPStatus(t *testing.T) {
+	fetcher := newTestFetcher(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return htmlResponse(req, http.StatusNonAuthoritativeInfo, `<html><head><title>Successful article</title></head></html>`), nil
+	}))
+
+	result, err := fetcher.Fetch(context.Background(), "https://example.com/article")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if result.Title != "Successful article" {
+		t.Fatalf("title: got %q", result.Title)
 	}
 }
 
@@ -115,11 +126,10 @@ func TestFetchReportsTransportError(t *testing.T) {
 
 func TestFetchReturnsContextCancellation(t *testing.T) {
 	started := make(chan struct{})
-	release := make(chan struct{})
 	fetcher := newTestFetcher(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		close(started)
-		<-release
-		return htmlResponse(req, http.StatusOK, `<html><head><title>Late response</title></head></html>`), nil
+		<-req.Context().Done()
+		return nil, req.Context().Err()
 	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -144,7 +154,6 @@ func TestFetchReturnsContextCancellation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Fetch did not return after cancellation")
 	}
-	close(release)
 }
 
 func TestFetchFollowsRedirect(t *testing.T) {
@@ -215,17 +224,14 @@ func TestFetchCharacterizesBodyLimit(t *testing.T) {
 		}
 	})
 
-	t.Run("above limit is truncated", func(t *testing.T) {
+	t.Run("above limit returns an error", func(t *testing.T) {
 		body := `<html><head><title>Truncated article</title></head><body><article><p>` +
 			strings.Repeat("readable word ", 40) + `TAIL_MARKER</p></article></body></html>`
 		fetcher := newTestFetcherWithBodyLimit(staticHTMLTransport(body), limit)
 
-		result, err := fetcher.Fetch(context.Background(), "https://example.com/large")
-		if err != nil {
-			t.Fatalf("fetch: %v", err)
-		}
-		if strings.Contains(result.Content, "TAIL_MARKER") {
-			t.Fatalf("expected content beyond %d bytes to be truncated", limit)
+		_, err := fetcher.Fetch(context.Background(), "https://example.com/large")
+		if !errors.Is(err, ErrResponseTooLarge) {
+			t.Fatalf("error: got %v, want ErrResponseTooLarge", err)
 		}
 	})
 }
@@ -306,19 +312,20 @@ func TestFetchReportsNoUsableContent(t *testing.T) {
 }
 
 func TestFetchLimitsConcurrentRequests(t *testing.T) {
-	fetcher := New()
 	var active atomic.Int32
 	var maximum atomic.Int32
 	started := make(chan struct{}, 4)
 	release := make(chan struct{})
-	fetcher.collector.WithTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	fetcher := newConfiguredTestFetcher(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		current := active.Add(1)
 		recordMaximum(&maximum, current)
 		started <- struct{}{}
 		<-release
 		active.Add(-1)
 		return htmlResponse(req, http.StatusOK, `<html><head><title>Concurrent article</title></head></html>`), nil
-	}))
+	}), func(config *fetchConfig) {
+		config.parallelism = 3
+	})
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 4)
@@ -386,21 +393,31 @@ func recordMaximum(maximum *atomic.Int32, current int32) {
 	}
 }
 
-func newTestFetcher(transport http.RoundTripper) *collyFetcher {
+func newTestFetcher(transport http.RoundTripper) Fetcher {
 	return newTestFetcherWithBodyLimit(transport, 10*1024*1024)
 }
 
-func newTestFetcherWithBodyLimit(transport http.RoundTripper, bodyLimit int) *collyFetcher {
-	c := colly.NewCollector(
-		colly.MaxDepth(1),
-		colly.Async(true),
-		colly.AllowURLRevisit(),
-		colly.MaxBodySize(bodyLimit),
-	)
-	c.UserAgent = "Mozilla/5.0 (compatible; Decruft/1.0)"
-	c.SetRequestTimeout(10 * time.Second)
-	c.WithTransport(transport)
-	return &collyFetcher{collector: c}
+func newTestFetcherWithBodyLimit(transport http.RoundTripper, bodyLimit int) Fetcher {
+	return newConfiguredTestFetcher(transport, func(config *fetchConfig) {
+		config.maxBodySize = bodyLimit
+	})
+}
+
+func newConfiguredTestFetcher(transport http.RoundTripper, configure func(*fetchConfig)) Fetcher {
+	config := testFetchConfig()
+	if configure != nil {
+		configure(&config)
+	}
+	return newCollyFetcher(config, transport)
+}
+
+func testFetchConfig() fetchConfig {
+	config := defaultFetchConfig()
+	config.maxRetries = 0
+	config.requestDelay = 0
+	config.randomDelay = 0
+	config.retryDelay = 0
+	return config
 }
 
 func staticHTMLTransport(body string) http.RoundTripper {

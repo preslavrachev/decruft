@@ -4,20 +4,41 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/netip"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gocolly/colly/v2"
 )
 
-const minContentWords = 50
+const (
+	minContentWords    = 50
+	defaultMaxBodySize = 10 * 1024 * 1024
+	defaultTimeout     = 10 * time.Second
+	defaultRetryDelay  = 100 * time.Millisecond
+	maxRetryDelay      = time.Second
+)
+
+var (
+	// ErrHTTPStatus reports a final non-2xx HTTP response.
+	ErrHTTPStatus = errors.New("unexpected HTTP status")
+	// ErrResponseTooLarge reports a response that exceeds the configured body limit.
+	ErrResponseTooLarge = errors.New("response body too large")
+	// ErrUnsupportedMediaType reports a response known not to contain readable text.
+	ErrUnsupportedMediaType = errors.New("unsupported media type")
+)
 
 type Result struct {
 	URL         string
@@ -45,28 +66,71 @@ type Fetcher interface {
 	Fetch(ctx context.Context, url string) (*Result, error)
 }
 
+// Option configures the default network fetcher.
+type Option func(*fetchConfig)
+
+// WithLanguage sends language as the preferred BCP 47 language in HTTP
+// requests. An empty value leaves the Accept-Language header unset.
+func WithLanguage(language string) Option {
+	return func(config *fetchConfig) {
+		config.language = strings.TrimSpace(language)
+	}
+}
+
+type fetchConfig struct {
+	language      string
+	maxBodySize   int
+	maxRetries    int
+	parallelism   int
+	requestDelay  time.Duration
+	randomDelay   time.Duration
+	retryDelay    time.Duration
+	maxRetryDelay time.Duration
+	timeout       time.Duration
+	now           func() time.Time
+	wait          func(context.Context, time.Duration) error
+}
+
 type collyFetcher struct {
-	collector *colly.Collector
+	config    fetchConfig
+	transport http.RoundTripper
+	slots     chan struct{}
 }
 
 func New() *collyFetcher {
-	c := colly.NewCollector(
-		colly.MaxDepth(1),
-		colly.Async(true),
-	)
+	return NewWithOptions()
+}
 
-	c.UserAgent = "Mozilla/5.0 (compatible; Decruft/1.0)"
-	c.AllowURLRevisit = true
-	c.SetRequestTimeout(10 * time.Second)
-	c.Limit(&colly.LimitRule{
-		DomainGlob:  "*",
-		Parallelism: 3,
-		Delay:       500 * time.Millisecond,
-		RandomDelay: 250 * time.Millisecond,
-	})
-	c.WithTransport(&http.Transport{DialContext: safeDialContext})
+// NewWithOptions creates the default guarded network fetcher with options.
+func NewWithOptions(options ...Option) *collyFetcher {
+	config := defaultFetchConfig()
+	for _, option := range options {
+		option(&config)
+	}
+	return newCollyFetcher(config, &http.Transport{DialContext: safeDialContext})
+}
 
-	return &collyFetcher{collector: c}
+func defaultFetchConfig() fetchConfig {
+	return fetchConfig{
+		maxBodySize:   defaultMaxBodySize,
+		maxRetries:    1,
+		parallelism:   3,
+		requestDelay:  500 * time.Millisecond,
+		randomDelay:   250 * time.Millisecond,
+		retryDelay:    defaultRetryDelay,
+		maxRetryDelay: maxRetryDelay,
+		timeout:       defaultTimeout,
+		now:           time.Now,
+		wait:          waitForContext,
+	}
+}
+
+func newCollyFetcher(config fetchConfig, transport http.RoundTripper) *collyFetcher {
+	return &collyFetcher{
+		config:    config,
+		transport: transport,
+		slots:     make(chan struct{}, config.parallelism),
+	}
 }
 
 func (f *collyFetcher) Fetch(ctx context.Context, rawURL string) (*Result, error) {
@@ -74,76 +138,300 @@ func (f *collyFetcher) Fetch(ctx context.Context, rawURL string) (*Result, error
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
-
-	result := &Result{URL: rawURL, Domain: parsed.Hostname()}
-	var fetchErr error
-
-	c := f.collector.Clone()
-
-	c.OnResponse(func(r *colly.Response) {
-		body := r.Body
-
-		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
-		if err != nil {
-			fetchErr = err
-			return
-		}
-
-		extractMeta(doc, result)
-
-		// Full extraction with clutter removal
-		content := extractContent(bytes.NewReader(body), true)
-
-		// If the result is thin, retry without partial-selector removal
-		if wordCount(content) < 200 {
-			if retry := extractContent(bytes.NewReader(body), false); wordCount(retry) > wordCount(content) {
-				content = retry
-			}
-		}
-
-		result.Content = content
-	})
-
-	c.OnError(func(r *colly.Response, err error) {
-		if r != nil && r.StatusCode != 0 {
-			fetchErr = fmt.Errorf("HTTP %d: %w", r.StatusCode, err)
-		} else {
-			fetchErr = err
-		}
-	})
-
-	if err := c.Visit(rawURL); err != nil {
-		return nil, fmt.Errorf("fetch failed: %w", err)
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
+		return nil, fmt.Errorf("invalid URL: expected an HTTP or HTTPS URL")
 	}
 
-	done := make(chan struct{})
-	go func() {
-		c.Wait()
-		close(done)
-	}()
-
 	select {
-	case <-done:
+	case f.slots <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	defer f.releaseSlot(ctx)
 
-	if fetchErr != nil {
-		return nil, fetchErr
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating cookie jar: %v", err)
 	}
 
+	for attemptNumber := 0; ; attemptNumber++ {
+		result := &Result{URL: rawURL, Domain: parsed.Hostname()}
+		attempt := f.fetchOnce(ctx, rawURL, result, jar)
+		if attempt.err == nil {
+			return finalizeResult(result, parsed, attempt.baseURL)
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !attempt.retryable || attemptNumber >= f.config.maxRetries {
+			return nil, attempt.err
+		}
+
+		delay := attempt.retryAfter
+		if delay == 0 {
+			delay = f.config.retryDelay
+		}
+		if err := f.config.wait(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+}
+
+type fetchAttempt struct {
+	baseURL    *url.URL
+	err        error
+	retryAfter time.Duration
+	retryable  bool
+}
+
+func (f *collyFetcher) fetchOnce(ctx context.Context, rawURL string, result *Result, jar http.CookieJar) fetchAttempt {
+	attempt := fetchAttempt{}
+	rawBodyTooLarge := &atomic.Bool{}
+	c := f.newCollector(ctx, jar, rawBodyTooLarge)
+
+	c.OnResponseHeaders(func(r *colly.Response) {
+		attempt.baseURL = r.Request.URL
+		if r.StatusCode < http.StatusOK || r.StatusCode >= http.StatusMultipleChoices {
+			attempt.err = fmt.Errorf("%w: HTTP %d %s", ErrHTTPStatus, r.StatusCode, http.StatusText(r.StatusCode))
+			attempt.retryable = shouldRetryStatus(r.StatusCode)
+			attempt.retryAfter = parseRetryAfter(r.Headers.Get("Retry-After"), f.config.now(), f.config.maxRetryDelay)
+			r.Request.Abort()
+			return
+		}
+
+		if mediaType := unsupportedMediaType(r.Headers.Get("Content-Type")); mediaType != "" {
+			attempt.err = fmt.Errorf("%w: %s", ErrUnsupportedMediaType, mediaType)
+			r.Request.Abort()
+			return
+		}
+
+		if contentLength, err := strconv.ParseInt(r.Headers.Get("Content-Length"), 10, 64); err == nil && contentLength > int64(f.config.maxBodySize) {
+			attempt.err = fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, f.config.maxBodySize)
+			r.Request.Abort()
+		}
+	})
+
+	c.OnResponse(func(r *colly.Response) {
+		attempt.baseURL = r.Request.URL
+		if len(r.Body) > f.config.maxBodySize {
+			attempt.err = fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, f.config.maxBodySize)
+			return
+		}
+		if err := extractResponse(r.Body, result); err != nil {
+			attempt.err = err
+		}
+	})
+
+	c.OnError(func(r *colly.Response, err error) {
+		if attempt.err != nil {
+			return
+		}
+		if ctx.Err() != nil {
+			attempt.err = ctx.Err()
+			return
+		}
+		attempt.err = fmt.Errorf("fetching URL: %v", err)
+		attempt.retryable = true
+	})
+
+	visitErr := c.Visit(rawURL)
+	if rawBodyTooLarge.Load() {
+		attempt.err = fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, f.config.maxBodySize)
+		attempt.retryable = false
+		return attempt
+	}
+	if visitErr != nil && attempt.err == nil {
+		if ctx.Err() != nil {
+			attempt.err = ctx.Err()
+		} else {
+			attempt.err = fmt.Errorf("fetching URL: %v", visitErr)
+			attempt.retryable = true
+		}
+	}
+	return attempt
+}
+
+func (f *collyFetcher) newCollector(ctx context.Context, jar http.CookieJar, rawBodyTooLarge *atomic.Bool) *colly.Collector {
+	headers := map[string]string{
+		"Accept": "text/html, application/xhtml+xml;q=0.9, */*;q=0.1",
+	}
+	if f.config.language != "" {
+		headers["Accept-Language"] = f.config.language
+	}
+
+	c := colly.NewCollector(
+		colly.MaxDepth(1),
+		colly.AllowURLRevisit(),
+		colly.DetectCharset(),
+		colly.ParseHTTPErrorResponse(),
+		colly.MaxBodySize(f.config.maxBodySize+1),
+		colly.Headers(headers),
+		colly.StdlibContext(ctx),
+	)
+	c.UserAgent = "Mozilla/5.0 (compatible; Decruft/1.0)"
+	c.SetRequestTimeout(f.config.timeout)
+	c.SetCookieJar(jar)
+	c.WithTransport(&bodyLimitTransport{
+		transport: f.transport,
+		limit:     int64(f.config.maxBodySize),
+		exceeded:  rawBodyTooLarge,
+	})
+	return c
+}
+
+type bodyLimitTransport struct {
+	transport http.RoundTripper
+	limit     int64
+	exceeded  *atomic.Bool
+}
+
+func (t *bodyLimitTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.transport.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	response.Body = &bodyLimitReadCloser{
+		ReadCloser: response.Body,
+		remaining:  t.limit + 1,
+		limit:      t.limit,
+		exceeded:   t.exceeded,
+	}
+	return response, nil
+}
+
+type bodyLimitReadCloser struct {
+	io.ReadCloser
+	remaining int64
+	read      int64
+	limit     int64
+	exceeded  *atomic.Bool
+}
+
+func (r *bodyLimitReadCloser) Read(buffer []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(buffer)) > r.remaining {
+		buffer = buffer[:r.remaining]
+	}
+
+	read, err := r.ReadCloser.Read(buffer)
+	r.read += int64(read)
+	r.remaining -= int64(read)
+	if r.read > r.limit {
+		r.exceeded.Store(true)
+	}
+	return read, err
+}
+
+func extractResponse(body []byte, result *Result) error {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	extractMeta(doc, result)
+
+	content := extractContent(bytes.NewReader(body), true)
+	if wordCount(content) < 200 {
+		if retry := extractContent(bytes.NewReader(body), false); wordCount(retry) > wordCount(content) {
+			content = retry
+		}
+	}
+	result.Content = content
+	return nil
+}
+
+func finalizeResult(result *Result, originalURL, responseURL *url.URL) (*Result, error) {
 	if result.Title == "" && result.Content == "" {
 		return nil, fmt.Errorf("no usable content found at URL")
 	}
 
-	// Resolve relative image URL
 	if result.ImageURL != "" && !strings.HasPrefix(result.ImageURL, "http") {
 		if ref, err := url.Parse(result.ImageURL); err == nil {
-			result.ImageURL = parsed.ResolveReference(ref).String()
+			baseURL := originalURL
+			if responseURL != nil {
+				baseURL = responseURL
+			}
+			result.ImageURL = baseURL.ResolveReference(ref).String()
 		}
 	}
 
 	return result, nil
+}
+
+func (f *collyFetcher) releaseSlot(ctx context.Context) {
+	delay := f.config.requestDelay
+	if f.config.randomDelay > 0 {
+		delay += time.Duration(f.config.now().UnixNano() % int64(f.config.randomDelay))
+	}
+	if delay > 0 {
+		_ = f.config.wait(ctx, delay)
+	}
+	<-f.slots
+}
+
+func shouldRetryStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseRetryAfter(value string, now time.Time, maximum time.Duration) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" || maximum <= 0 {
+		return 0
+	}
+
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		if seconds > int64(maximum/time.Second) {
+			return maximum
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(value); err == nil {
+		return min(max(retryAt.Sub(now), 0), maximum)
+	}
+	return 0
+}
+
+func unsupportedMediaType(contentType string) string {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mediaType = strings.TrimSpace(strings.Split(contentType, ";")[0])
+	}
+	mediaType = strings.ToLower(mediaType)
+	if strings.HasPrefix(mediaType, "image/") ||
+		strings.HasPrefix(mediaType, "audio/") ||
+		strings.HasPrefix(mediaType, "video/") ||
+		strings.HasPrefix(mediaType, "font/") {
+		return mediaType
+	}
+	switch mediaType {
+	case "application/octet-stream", "application/pdf", "application/zip":
+		return mediaType
+	default:
+		return ""
+	}
+}
+
+func waitForContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // extractMeta reads OG, Twitter Card, <title>, and <meta name="description"> tags.

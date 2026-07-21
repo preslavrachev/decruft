@@ -101,6 +101,12 @@ if content == "" {
 }
 ```
 
+Use `NewWithOptions` to request a preferred document language:
+
+```go
+fetcher := decruft.NewWithOptions(decruft.WithLanguage("en"))
+```
+
 ## How it works
 
 The extraction pipeline:
@@ -119,6 +125,15 @@ The default fetcher is intended for use with untrusted URLs. Its HTTP transport
 blocks loopback, private, link-local, cloud metadata, documentation, multicast,
 and other reserved IP ranges. DNS results are validated before dialing to
 reduce SSRF and DNS-rebinding risk.
+
+Responses are limited to 10 MB. Known binary media types and oversized
+responses are rejected before their bodies are read when response headers make
+that possible. The fetcher retries one transient transport failure or HTTP 429,
+502, 503, or 504 response, with `Retry-After` capped at one second. Cookies are
+kept within one fetch and its redirects, but are not shared between calls.
+
+Callers can identify policy failures with `errors.Is` and
+`ErrHTTPStatus`, `ErrResponseTooLarge`, or `ErrUnsupportedMediaType`.
 
 `IsBlockedAddr` is exported for applications that need to apply the same
 address policy before calling `Fetch`.
