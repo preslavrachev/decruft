@@ -176,9 +176,9 @@ func findBestElement(sels []*goquery.Selection, minScore int) *goquery.Selection
 // and content scoring, mirroring defuddle's findMainContent + findContentByScoring.
 func findMainContent(root *goquery.Selection) *goquery.Selection {
 	type candidate struct {
-		sel   *goquery.Selection
-		score int
-		idx   int
+		selection     *goquery.Selection
+		score         int
+		selectorIndex int
 	}
 
 	var candidates []candidate
@@ -186,7 +186,11 @@ func findMainContent(root *goquery.Selection) *goquery.Selection {
 	for i, sel := range entryPointSelectors {
 		root.Find(sel).Each(func(_ int, s *goquery.Selection) {
 			score := (len(entryPointSelectors)-i)*40 + scoreElement(s)
-			candidates = append(candidates, candidate{s, score, i})
+			candidates = append(candidates, candidate{
+				selection:     s,
+				score:         score,
+				selectorIndex: i,
+			})
 		})
 	}
 
@@ -203,15 +207,41 @@ func findMainContent(root *goquery.Selection) *goquery.Selection {
 
 	top := candidates[0]
 	best := top
-
-	// Prefer a more-specific child that matched a higher-priority selector
-	for _, c := range candidates[1:] {
-		if c.idx < best.idx && nodeContains(best.sel.Get(0), c.sel.Get(0)) {
-			best = c
+	descendantCountBySelector := make(map[int]int)
+	for _, c := range candidates {
+		if isStrictDescendantOf(c.selection.Get(0), top.selection.Get(0)) {
+			descendantCountBySelector[c.selectorIndex]++
 		}
 	}
 
-	return best.sel
+	// Candidate selection happens in two phases. Scores first choose the
+	// strongest content region anywhere in the document. This pass may then
+	// narrow that region to a meaningful descendant which matched a
+	// higher-priority entry-point selector. It must not broaden the region to
+	// an ancestor or jump to an unrelated branch.
+	//
+	// Comparing against best, rather than top, permits monotonic narrowing such
+	// as body -> main -> article -> .entry-content. Top remains the stable
+	// reference when detecting listing pages with several equivalent children.
+	for _, child := range candidates[1:] {
+		childWords := len(strings.Fields(child.selection.Text()))
+		// Short matches are often related-content cards rather than the article.
+		if child.selectorIndex >= best.selectorIndex ||
+			!isStrictDescendantOf(child.selection.Get(0), best.selection.Get(0)) ||
+			childWords <= 50 {
+			continue
+		}
+
+		if descendantCountBySelector[child.selectorIndex] > 1 {
+			// Several equivalent children usually indicate a listing page whose
+			// parent is the actual content boundary.
+			continue
+		}
+
+		best = child
+	}
+
+	return best.selection
 }
 
 func findByScoring(root *goquery.Selection) *goquery.Selection {
@@ -228,7 +258,9 @@ func findByScoring(root *goquery.Selection) *goquery.Selection {
 	return best
 }
 
-func nodeContains(ancestor, descendant *html.Node) bool {
+// isStrictDescendantOf reports whether descendant is below ancestor in the DOM.
+// A node is not considered a descendant of itself.
+func isStrictDescendantOf(descendant, ancestor *html.Node) bool {
 	if ancestor == nil || descendant == nil {
 		return false
 	}
