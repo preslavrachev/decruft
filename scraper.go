@@ -2,6 +2,7 @@ package decruft
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,11 +17,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/gocolly/colly/v2"
+	"golang.org/x/net/html/charset"
 )
 
 const (
@@ -29,6 +30,7 @@ const (
 	defaultTimeout     = 10 * time.Second
 	defaultRetryDelay  = 100 * time.Millisecond
 	maxRetryDelay      = time.Second
+	maxResponseDrain   = 4 * 1024
 )
 
 var (
@@ -91,23 +93,23 @@ type fetchConfig struct {
 	wait          func(context.Context, time.Duration) error
 }
 
-type collyFetcher struct {
+type httpFetcher struct {
 	config    fetchConfig
 	transport http.RoundTripper
 	slots     chan struct{}
 }
 
-func New() *collyFetcher {
+func New() *httpFetcher {
 	return NewWithOptions()
 }
 
 // NewWithOptions creates the default guarded network fetcher with options.
-func NewWithOptions(options ...Option) *collyFetcher {
+func NewWithOptions(options ...Option) *httpFetcher {
 	config := defaultFetchConfig()
 	for _, option := range options {
 		option(&config)
 	}
-	return newCollyFetcher(config, &http.Transport{DialContext: safeDialContext})
+	return newHTTPFetcher(config, &http.Transport{DialContext: safeDialContext})
 }
 
 func defaultFetchConfig() fetchConfig {
@@ -125,15 +127,15 @@ func defaultFetchConfig() fetchConfig {
 	}
 }
 
-func newCollyFetcher(config fetchConfig, transport http.RoundTripper) *collyFetcher {
-	return &collyFetcher{
+func newHTTPFetcher(config fetchConfig, transport http.RoundTripper) *httpFetcher {
+	return &httpFetcher{
 		config:    config,
 		transport: transport,
 		slots:     make(chan struct{}, config.parallelism),
 	}
 }
 
-func (f *collyFetcher) Fetch(ctx context.Context, rawURL string) (*Result, error) {
+func (f *httpFetcher) Fetch(ctx context.Context, rawURL string) (*Result, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
@@ -184,105 +186,127 @@ type fetchAttempt struct {
 	retryable  bool
 }
 
-func (f *collyFetcher) fetchOnce(ctx context.Context, rawURL string, result *Result, jar http.CookieJar) fetchAttempt {
+func (f *httpFetcher) fetchOnce(ctx context.Context, rawURL string, result *Result, jar http.CookieJar) fetchAttempt {
 	attempt := fetchAttempt{}
-	rawBodyTooLarge := &atomic.Bool{}
-	c := f.newCollector(ctx, jar, rawBodyTooLarge)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		attempt.err = fmt.Errorf("creating request: %v", err)
+		return attempt
+	}
+	request.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Decruft/1.0)")
+	request.Header.Set("Accept", "text/html, application/xhtml+xml;q=0.9, */*;q=0.1")
+	request.Header.Set("Accept-Encoding", "gzip")
+	if f.config.language != "" {
+		request.Header.Set("Accept-Language", f.config.language)
+	}
 
-	c.OnResponseHeaders(func(r *colly.Response) {
-		attempt.baseURL = r.Request.URL
-		if r.StatusCode < http.StatusOK || r.StatusCode >= http.StatusMultipleChoices {
-			attempt.err = fmt.Errorf("%w: HTTP %d %s", ErrHTTPStatus, r.StatusCode, http.StatusText(r.StatusCode))
-			attempt.retryable = shouldRetryStatus(r.StatusCode)
-			attempt.retryAfter = parseRetryAfter(r.Headers.Get("Retry-After"), f.config.now(), f.config.maxRetryDelay)
-			r.Request.Abort()
-			return
-		}
-
-		if mediaType := unsupportedMediaType(r.Headers.Get("Content-Type")); mediaType != "" {
-			attempt.err = fmt.Errorf("%w: %s", ErrUnsupportedMediaType, mediaType)
-			r.Request.Abort()
-			return
-		}
-
-		if contentLength, err := strconv.ParseInt(r.Headers.Get("Content-Length"), 10, 64); err == nil && contentLength > int64(f.config.maxBodySize) {
-			attempt.err = fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, f.config.maxBodySize)
-			r.Request.Abort()
-		}
-	})
-
-	c.OnResponse(func(r *colly.Response) {
-		attempt.baseURL = r.Request.URL
-		if len(r.Body) > f.config.maxBodySize {
-			attempt.err = fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, f.config.maxBodySize)
-			return
-		}
-		if err := extractResponse(r.Body, result); err != nil {
-			attempt.err = err
-		}
-	})
-
-	c.OnError(func(r *colly.Response, err error) {
-		if attempt.err != nil {
-			return
-		}
+	client := &http.Client{
+		Transport: &bodyLimitTransport{
+			transport: f.transport,
+			limit:     int64(f.config.maxBodySize),
+		},
+		Jar:     jar,
+		Timeout: f.config.timeout,
+	}
+	response, err := client.Do(request)
+	if err != nil {
 		if ctx.Err() != nil {
 			attempt.err = ctx.Err()
-			return
+			return attempt
 		}
 		attempt.err = fmt.Errorf("fetching URL: %v", err)
 		attempt.retryable = true
-	})
-
-	visitErr := c.Visit(rawURL)
-	if rawBodyTooLarge.Load() {
-		attempt.err = fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, f.config.maxBodySize)
-		attempt.retryable = false
 		return attempt
 	}
-	if visitErr != nil && attempt.err == nil {
-		if ctx.Err() != nil {
-			attempt.err = ctx.Err()
-		} else {
-			attempt.err = fmt.Errorf("fetching URL: %v", visitErr)
-			attempt.retryable = true
-		}
+	defer response.Body.Close()
+	attempt.baseURL = response.Request.URL
+
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		drainResponseBody(response.Body)
+		attempt.err = fmt.Errorf("%w: HTTP %d %s", ErrHTTPStatus, response.StatusCode, http.StatusText(response.StatusCode))
+		attempt.retryable = shouldRetryStatus(response.StatusCode)
+		attempt.retryAfter = parseRetryAfter(response.Header.Get("Retry-After"), f.config.now(), f.config.maxRetryDelay)
+		return attempt
+	}
+	if mediaType := unsupportedMediaType(response.Header.Get("Content-Type")); mediaType != "" {
+		attempt.err = fmt.Errorf("%w: %s", ErrUnsupportedMediaType, mediaType)
+		return attempt
+	}
+	if responseContentLength(response) > int64(f.config.maxBodySize) {
+		attempt.err = fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, f.config.maxBodySize)
+		return attempt
+	}
+
+	body, err := readResponseBody(response, f.config.maxBodySize)
+	if errors.Is(err, ErrResponseTooLarge) {
+		attempt.err = fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, f.config.maxBodySize)
+		return attempt
+	}
+	if err != nil {
+		attempt.err = fmt.Errorf("reading response: %v", err)
+		attempt.retryable = isRetryableBodyReadError(err)
+		return attempt
+	}
+	if err := extractResponse(body, result); err != nil {
+		attempt.err = err
 	}
 	return attempt
 }
 
-func (f *collyFetcher) newCollector(ctx context.Context, jar http.CookieJar, rawBodyTooLarge *atomic.Bool) *colly.Collector {
-	headers := map[string]string{
-		"Accept": "text/html, application/xhtml+xml;q=0.9, */*;q=0.1",
+func responseContentLength(response *http.Response) int64 {
+	if response.ContentLength > 0 {
+		return response.ContentLength
 	}
-	if f.config.language != "" {
-		headers["Accept-Language"] = f.config.language
+	contentLength, _ := strconv.ParseInt(response.Header.Get("Content-Length"), 10, 64)
+	return contentLength
+}
+
+func readResponseBody(response *http.Response, limit int) ([]byte, error) {
+	var reader io.Reader = response.Body
+	if !response.Uncompressed && strings.Contains(strings.ToLower(response.Header.Get("Content-Encoding")), "gzip") {
+		compressed, err := gzip.NewReader(reader)
+		if err != nil {
+			return nil, err
+		}
+		defer compressed.Close()
+		reader = compressed
 	}
 
-	c := colly.NewCollector(
-		colly.MaxDepth(1),
-		colly.AllowURLRevisit(),
-		colly.DetectCharset(),
-		colly.ParseHTTPErrorResponse(),
-		colly.MaxBodySize(f.config.maxBodySize+1),
-		colly.Headers(headers),
-		colly.StdlibContext(ctx),
-	)
-	c.UserAgent = "Mozilla/5.0 (compatible; Decruft/1.0)"
-	c.SetRequestTimeout(f.config.timeout)
-	c.SetCookieJar(jar)
-	c.WithTransport(&bodyLimitTransport{
-		transport: f.transport,
-		limit:     int64(f.config.maxBodySize),
-		exceeded:  rawBodyTooLarge,
-	})
-	return c
+	encoded, err := readBoundedBody(reader, limit)
+	if err != nil {
+		return nil, err
+	}
+	contentType := response.Header.Get("Content-Type")
+	if !hasDeclaredCharset(contentType) && utf8.Valid(encoded) {
+		return bytes.TrimPrefix(encoded, []byte("\xef\xbb\xbf")), nil
+	}
+
+	decoded, err := charset.NewReader(bytes.NewReader(encoded), contentType)
+	if err != nil {
+		return nil, err
+	}
+	return readBoundedBody(decoded, limit)
+}
+
+func readBoundedBody(reader io.Reader, limit int) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, int64(limit)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > limit {
+		return nil, ErrResponseTooLarge
+	}
+	return body, nil
+}
+
+func hasDeclaredCharset(contentType string) bool {
+	_, parameters, err := mime.ParseMediaType(contentType)
+	return err == nil && strings.TrimSpace(parameters["charset"]) != ""
 }
 
 type bodyLimitTransport struct {
 	transport http.RoundTripper
 	limit     int64
-	exceeded  *atomic.Bool
 }
 
 func (t *bodyLimitTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -292,9 +316,7 @@ func (t *bodyLimitTransport) RoundTrip(request *http.Request) (*http.Response, e
 	}
 	response.Body = &bodyLimitReadCloser{
 		ReadCloser: response.Body,
-		remaining:  t.limit + 1,
-		limit:      t.limit,
-		exceeded:   t.exceeded,
+		remaining:  t.limit,
 	}
 	return response, nil
 }
@@ -302,26 +324,56 @@ func (t *bodyLimitTransport) RoundTrip(request *http.Request) (*http.Response, e
 type bodyLimitReadCloser struct {
 	io.ReadCloser
 	remaining int64
-	read      int64
-	limit     int64
-	exceeded  *atomic.Bool
 }
 
 func (r *bodyLimitReadCloser) Read(buffer []byte) (int, error) {
 	if r.remaining == 0 {
-		return 0, io.EOF
+		var probe [1]byte
+		read, err := r.ReadCloser.Read(probe[:])
+		if read > 0 {
+			return 0, ErrResponseTooLarge
+		}
+		return 0, classifyBodyReadError(err)
 	}
 	if int64(len(buffer)) > r.remaining {
 		buffer = buffer[:r.remaining]
 	}
 
 	read, err := r.ReadCloser.Read(buffer)
-	r.read += int64(read)
 	r.remaining -= int64(read)
-	if r.read > r.limit {
-		r.exceeded.Store(true)
+	return read, classifyBodyReadError(err)
+}
+
+type transportBodyReadError struct {
+	err error
+}
+
+func (e *transportBodyReadError) Error() string {
+	return e.err.Error()
+}
+
+func (e *transportBodyReadError) Unwrap() error {
+	return e.err
+}
+
+func classifyBodyReadError(err error) error {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, ErrResponseTooLarge) {
+		return err
 	}
-	return read, err
+	return &transportBodyReadError{err: err}
+}
+
+func isRetryableBodyReadError(err error) bool {
+	var readErr *transportBodyReadError
+	if errors.As(err, &readErr) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) && networkErr.Timeout()
+}
+
+func drainResponseBody(body io.Reader) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxResponseDrain))
 }
 
 func extractResponse(body []byte, result *Result) error {
@@ -359,7 +411,7 @@ func finalizeResult(result *Result, originalURL, responseURL *url.URL) (*Result,
 	return result, nil
 }
 
-func (f *collyFetcher) releaseSlot(ctx context.Context) {
+func (f *httpFetcher) releaseSlot(ctx context.Context) {
 	delay := f.config.requestDelay
 	if f.config.randomDelay > 0 {
 		delay += time.Duration(f.config.now().UnixNano() % int64(f.config.randomDelay))
@@ -700,7 +752,7 @@ func IsBlockedAddr(ip netip.Addr) bool {
 
 var baseDialer = &net.Dialer{}
 
-// safeDialContext is http.Transport.DialContext for every cloned collector.
+// safeDialContext is the guarded http.Transport.DialContext used by the fetcher.
 // Go passes addr as "host:port" where host may be a hostname or an IP.
 // We resolve it ourselves, validate every returned IP, then dial the first
 // one directly so there is no second DNS lookup (no rebinding window).

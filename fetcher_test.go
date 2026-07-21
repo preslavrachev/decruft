@@ -408,7 +408,7 @@ func newConfiguredTestFetcher(transport http.RoundTripper, configure func(*fetch
 	if configure != nil {
 		configure(&config)
 	}
-	return newCollyFetcher(config, transport)
+	return newHTTPFetcher(config, transport)
 }
 
 func testFetchConfig() fetchConfig {
