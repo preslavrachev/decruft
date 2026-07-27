@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"html"
 	"io"
 	"strings"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/preslavrachev/decruft"
 	"github.com/urfave/cli/v3"
+	xhtml "golang.org/x/net/html"
 )
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -53,7 +56,10 @@ func newCommand(fetcher decruft.Fetcher, stdout, stderr io.Writer) *cli.Command 
 
 					output := body
 					if cmd.Bool("markdown") {
-						output = renderMarkdown(result.Title, body)
+						output, err = renderMarkdown(result)
+						if err != nil {
+							return fmt.Errorf("converting output to Markdown: %w", err)
+						}
 					} else if strings.TrimSpace(output) == "" {
 						output = result.Title
 					}
@@ -69,16 +75,70 @@ func newCommand(fetcher decruft.Fetcher, stdout, stderr io.Writer) *cli.Command 
 	return cmd
 }
 
-func renderMarkdown(title, content string) string {
-	title = strings.TrimSpace(title)
-	content = strings.TrimSpace(content)
-
-	switch {
-	case title == "":
-		return content
-	case content == "":
-		return "# " + title
-	default:
-		return fmt.Sprintf("# %s\n\n%s", title, content)
+func renderMarkdown(result *decruft.Result) (string, error) {
+	contentHTML := strings.TrimSpace(result.Content)
+	if contentHTML == "" {
+		contentHTML = plainTextHTML(result.Description)
+	} else if !strings.Contains(contentHTML, "<") {
+		contentHTML = plainTextHTML(contentHTML)
 	}
+
+	title := strings.TrimSpace(result.Title)
+	if title != "" && !hasEquivalentH1(contentHTML, title) {
+		contentHTML = "<h1>" + html.EscapeString(title) + "</h1>" + contentHTML
+	}
+
+	projection := &decruft.Result{Content: contentHTML}
+	return projection.Markdown()
+}
+
+func hasEquivalentH1(contentHTML, title string) bool {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(contentHTML))
+	if err != nil {
+		return false
+	}
+	leading := leadingContentNode(doc.Selection.Get(0))
+	if leading == nil || leading.Type != xhtml.ElementNode || leading.Data != "h1" {
+		return false
+	}
+	heading := goquery.NewDocumentFromNode(leading).Text()
+	return strings.EqualFold(strings.TrimSpace(heading), strings.TrimSpace(title))
+}
+
+func leadingContentNode(node *xhtml.Node) *xhtml.Node {
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		switch child.Type {
+		case xhtml.TextNode:
+			if strings.TrimSpace(child.Data) != "" {
+				return child
+			}
+		case xhtml.ElementNode:
+			switch child.Data {
+			case "html", "head", "body", "article", "main", "div", "section":
+				if leading := leadingContentNode(child); leading != nil {
+					return leading
+				}
+			default:
+				return child
+			}
+		}
+	}
+	return nil
+}
+
+func plainTextHTML(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	var content strings.Builder
+	for paragraph := range strings.SplitSeq(text, "\n\n") {
+		paragraph = strings.TrimSpace(paragraph)
+		if paragraph == "" {
+			continue
+		}
+		escaped := html.EscapeString(paragraph)
+		escaped = strings.ReplaceAll(escaped, "\n", "<br>")
+		content.WriteString("<p>")
+		content.WriteString(escaped)
+		content.WriteString("</p>")
+	}
+	return content.String()
 }

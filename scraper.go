@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"mime"
 	"net"
@@ -20,6 +21,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/table"
 	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/net/html/charset"
 )
@@ -43,25 +48,82 @@ var (
 )
 
 type Result struct {
-	URL         string
-	Title       string
+	// URL is the originally requested URL.
+	URL string
+	// Title is the extracted document title.
+	Title string
+	// Description is extracted metadata and may be plain text.
 	Description string
-	ImageURL    string
-	Domain      string
-	Content     string
+	// ImageURL is the absolute URL of the extracted representative image.
+	ImageURL string
+	// Domain is the hostname of the originally requested URL.
+	Domain string
+	// Content is cleaned HTML for the selected main-content subtree. It is not
+	// sanitized or trusted HTML and must be sanitized before browser insertion.
+	Content string
+	// WordCount is the number of whitespace-delimited words in Content's
+	// visible DOM text.
+	WordCount int
 }
 
-// BestContent returns the richest text available: full Content if substantial,
-// Description as fallback (may hold JSON-LD articleBody), or "" when both are
-// thin so callers can fall back to their own metadata (e.g. RSS description).
+// Markdown converts the cleaned HTML in Content to Markdown. It preserves
+// supported document structure, including GFM tables.
+func (r *Result) Markdown() (string, error) {
+	if strings.TrimSpace(r.Content) == "" {
+		return "", nil
+	}
+
+	markdownConverter := converter.NewConverter(
+		converter.WithPlugins(
+			base.NewBasePlugin(),
+			commonmark.NewCommonmarkPlugin(),
+			table.NewTablePlugin(),
+		),
+	)
+	markdown, err := markdownConverter.ConvertString(r.Content)
+	if err != nil {
+		return "", fmt.Errorf("converting cleaned HTML: %v", err)
+	}
+	return markdown, nil
+}
+
+// BestContent returns cleaned HTML when Content has at least 50 visible words,
+// Description as a plain-text fallback when it is substantial, or "" when both
+// are thin.
+//
+// Deprecated: use BestHTML, which always returns cleaned HTML and therefore
+// has a uniform output contract.
 func (r *Result) BestContent() string {
-	if len(strings.Fields(r.Content)) >= minContentWords {
+	if r.contentWordCount() >= minContentWords {
 		return r.Content
 	}
 	if len(strings.Fields(r.Description)) >= minContentWords {
 		return r.Description
 	}
 	return ""
+}
+
+// BestHTML returns cleaned HTML when Content has at least 50 visible words. If
+// Content is thin but Description is substantial, it returns the description
+// HTML-escaped inside a paragraph. It returns "" when both are thin.
+//
+// The returned HTML is not sanitized or trusted and must be sanitized before
+// browser insertion.
+func (r *Result) BestHTML() string {
+	if r.contentWordCount() >= minContentWords {
+		return r.Content
+	}
+	if len(strings.Fields(r.Description)) >= minContentWords {
+		return "<p>" + html.EscapeString(r.Description) + "</p>"
+	}
+	return ""
+}
+
+func (r *Result) contentWordCount() int {
+	if r.WordCount != 0 || strings.TrimSpace(r.Content) == "" {
+		return r.WordCount
+	}
+	return visibleWordCount(r.Content)
 }
 
 type Fetcher interface {
@@ -247,7 +309,7 @@ func (f *httpFetcher) fetchOnce(ctx context.Context, rawURL string, result *Resu
 		attempt.retryable = isRetryableBodyReadError(err)
 		return attempt
 	}
-	if err := extractResponse(body, result); err != nil {
+	if err := extractResponse(body, result, response.Request.URL); err != nil {
 		attempt.err = err
 	}
 	return attempt
@@ -376,37 +438,49 @@ func drainResponseBody(body io.Reader) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxResponseDrain))
 }
 
-func extractResponse(body []byte, result *Result) error {
+func extractResponse(body []byte, result *Result, responseURL *url.URL) error {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	extractMeta(doc, result)
+	baseURL := documentBaseURL(doc, responseURL)
+	result.ImageURL, _ = normalizeURL(result.ImageURL, baseURL, imageURLSchemes)
 
-	content := extractContent(bytes.NewReader(body), true)
-	if wordCount(content) < 200 {
-		if retry := extractContent(bytes.NewReader(body), false); wordCount(retry) > wordCount(content) {
+	content, err := extractContentCandidate(bytes.NewReader(body), true)
+	if err != nil {
+		return err
+	}
+	if content.wordCount < 200 {
+		retry, err := extractContentCandidate(bytes.NewReader(body), false)
+		if err != nil {
+			return err
+		}
+		if retry.wordCount > content.wordCount {
 			content = retry
 		}
 	}
-	result.Content = content
+
+	normalizeContentURLs(content.selection, baseURL)
+	contentHTML, err := goquery.OuterHtml(content.selection)
+	if err != nil {
+		return err
+	}
+	result.Content = strings.TrimSpace(contentHTML)
+	result.WordCount = content.wordCount
 	return nil
 }
 
 func finalizeResult(result *Result, originalURL, responseURL *url.URL) (*Result, error) {
-	if result.Title == "" && result.Content == "" {
+	if result.Title == "" && result.WordCount == 0 {
 		return nil, fmt.Errorf("no usable content found at URL")
 	}
 
-	if result.ImageURL != "" && !strings.HasPrefix(result.ImageURL, "http") {
-		if ref, err := url.Parse(result.ImageURL); err == nil {
-			baseURL := originalURL
-			if responseURL != nil {
-				baseURL = responseURL
-			}
-			result.ImageURL = baseURL.ResolveReference(ref).String()
-		}
+	baseURL := originalURL
+	if responseURL != nil {
+		baseURL = responseURL
 	}
+	result.ImageURL, _ = normalizeURL(result.ImageURL, baseURL, imageURLSchemes)
 
 	return result, nil
 }
@@ -569,12 +643,32 @@ func extractMeta(doc *goquery.Document, result *Result) {
 	}
 }
 
-// extractContent parses a fresh copy of the HTML body and runs the full
-// defuddle pipeline: remove clutter → score blocks → find main content → extract text.
+type contentCandidate struct {
+	selection *goquery.Selection
+	wordCount int
+}
+
+// extractContent is retained as an internal convenience for focused extraction
+// tests. Production extraction uses extractContentCandidate so parse and
+// serialization errors can be returned to the caller.
 func extractContent(body *bytes.Reader, removePartial bool) string {
-	doc, err := goquery.NewDocumentFromReader(body)
+	candidate, err := extractContentCandidate(body, removePartial)
 	if err != nil {
 		return ""
+	}
+	contentHTML, err := goquery.OuterHtml(candidate.selection)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(contentHTML)
+}
+
+// extractContentCandidate parses a fresh copy of the HTML body and runs the
+// full extraction pipeline while retaining the selected cleaned DOM subtree.
+func extractContentCandidate(body *bytes.Reader, removePartial bool) (*contentCandidate, error) {
+	doc, err := goquery.NewDocumentFromReader(body)
+	if err != nil {
+		return nil, err
 	}
 
 	root := doc.Selection
@@ -602,8 +696,79 @@ func extractContent(body *bytes.Reader, removePartial bool) string {
 		main = root
 	}
 
-	// 6. Extract readable text
-	return extractText(main)
+	return &contentCandidate{
+		selection: main,
+		wordCount: len(strings.Fields(strings.TrimSpace(main.Text()))),
+	}, nil
+}
+
+func documentBaseURL(doc *goquery.Document, responseURL *url.URL) *url.URL {
+	if responseURL == nil {
+		return nil
+	}
+
+	if value, ok := doc.Find("base[href]").First().Attr("href"); ok {
+		if normalized, valid := normalizeURL(value, responseURL, imageURLSchemes); valid {
+			if base, err := url.Parse(normalized); err == nil {
+				return base
+			}
+		}
+	}
+	return responseURL
+}
+
+var (
+	linkURLSchemes  = map[string]bool{"http": true, "https": true, "mailto": true, "tel": true}
+	imageURLSchemes = map[string]bool{"http": true, "https": true}
+)
+
+func normalizeContentURLs(content *goquery.Selection, baseURL *url.URL) {
+	normalizeURLAttribute(content, "a[href]", "href", baseURL, linkURLSchemes)
+	normalizeURLAttribute(content, "img[src]", "src", baseURL, imageURLSchemes)
+}
+
+func normalizeURLAttribute(content *goquery.Selection, selector, attribute string, baseURL *url.URL, allowedSchemes map[string]bool) {
+	elements := content.Find(selector).AddSelection(content.Filter(selector))
+	elements.Each(func(_ int, element *goquery.Selection) {
+		value, _ := element.Attr(attribute)
+		normalized, valid := normalizeURL(value, baseURL, allowedSchemes)
+		if !valid {
+			element.RemoveAttr(attribute)
+			return
+		}
+		element.SetAttr(attribute, normalized)
+	})
+}
+
+func normalizeURL(value string, baseURL *url.URL, allowedSchemes map[string]bool) (string, bool) {
+	ref, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || ref.String() == "" {
+		return "", false
+	}
+	if ref.Scheme == "" {
+		if baseURL == nil {
+			return "", false
+		}
+		ref = baseURL.ResolveReference(ref)
+	}
+
+	scheme := strings.ToLower(ref.Scheme)
+	if !allowedSchemes[scheme] {
+		return "", false
+	}
+	ref.Scheme = scheme
+	if (scheme == "http" || scheme == "https") && ref.Hostname() == "" {
+		return "", false
+	}
+	return ref.String(), true
+}
+
+func visibleWordCount(content string) int {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(content))
+	if err != nil {
+		return 0
+	}
+	return len(strings.Fields(strings.TrimSpace(doc.Text())))
 }
 
 // removeExactSelectors removes elements matching the exact CSS selector list.
@@ -701,10 +866,6 @@ func extractText(s *goquery.Selection) string {
 	}
 
 	return strings.TrimSpace(s.Text())
-}
-
-func wordCount(s string) int {
-	return len(strings.Fields(s))
 }
 
 // blockedPrefixes covers all IANA special-use ranges that must not be

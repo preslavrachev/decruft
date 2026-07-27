@@ -1,7 +1,7 @@
 # decruft
 
-Decruft extracts readable plain-text content and metadata from cluttered web
-pages.
+Decruft extracts cleaned HTML and metadata from cluttered web pages. It can
+project the cleaned HTML to structured Markdown on demand.
 
 It fetches a URL, removes navigation, advertising, forms, sidebars, sharing
 widgets, and other page chrome, then scores the remaining DOM to find the main
@@ -41,8 +41,10 @@ decruft parse https://example.com/article --markdown
 decruft parse https://example.com/article --md
 ```
 
-Markdown output includes the extracted title as a heading followed by the
-readable content. Without `--markdown`, the command prints plain text.
+`--markdown` produces real Markdown that preserves supported headings, links,
+images, emphasis, lists, blockquotes, code blocks, and GFM tables. The command
+adds the extracted title only when the converted content does not already begin
+with the same H1. Without `--markdown`, the command prints cleaned HTML.
 
 The CLI currently accepts one URL at a time. It does not yet parse local files,
 read HTML from standard input, emit JSON, or execute page JavaScript.
@@ -75,6 +77,12 @@ func main() {
 	fmt.Println(result.Description)
 	fmt.Println(result.ImageURL)
 	fmt.Println(result.Content)
+
+	markdown, err := result.Markdown()
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(markdown)
 }
 ```
 
@@ -87,19 +95,32 @@ type Result struct {
 	Description string
 	ImageURL    string
 	Domain      string
-	Content     string
+	Content     string // Cleaned HTML.
+	WordCount   int    // Visible words in Content.
 }
 ```
 
-Use `BestContent` when short or empty extractions should fall back to a
-substantial description:
+`Result.Content` is the cleaned selected DOM subtree and is the canonical
+content representation. `Result.Markdown()` converts that HTML only when
+requested. `WordCount` counts whitespace-delimited words in the visible DOM
+text, not HTML tokens.
+
+The cleaned HTML is not sanitized or trusted HTML. Sanitize it before inserting
+it into a browser document.
+
+Use `BestHTML` when short or empty extractions should fall back to a substantial
+description. It always returns HTML: either substantial cleaned `Content`, or
+an HTML-escaped `Description` wrapped in a paragraph:
 
 ```go
-content := result.BestContent()
+content := result.BestHTML()
 if content == "" {
 	// Fall back to application-specific metadata, such as an RSS description.
 }
 ```
+
+`BestContent` is deprecated because its legacy fallback can return plain text
+while its primary branch returns HTML.
 
 Use `NewWithOptions` to request a preferred document language:
 
@@ -116,8 +137,11 @@ The extraction pipeline:
 3. Removes short navigation and call-to-action paragraphs.
 4. Scores the remaining DOM blocks.
 5. Selects the strongest main-content candidate.
-6. Extracts paragraphs and code blocks as readable plain text.
-7. Retries with less aggressive removal when the first result is too thin.
+6. Retries with less aggressive removal when the first candidate is too thin.
+7. Resolves content links and images against the document base or final
+   response URL.
+8. Serializes the winning cleaned DOM subtree as HTML.
+9. Converts that HTML to Markdown only when requested.
 
 ## Network safety
 
@@ -140,7 +164,8 @@ address policy before calling `Fetch`.
 
 ## Current scope
 
-- The library output is plain text. The CLI can wrap it as basic Markdown.
+- The library and default CLI output is cleaned, unsanitized HTML.
+- `Result.Markdown()`, `--markdown`, and `--md` produce structured Markdown.
 - Pages are parsed from their HTTP response and JavaScript is not executed.
 - Extraction is heuristic and may need site-specific regression fixes.
 - The default fetcher has a 10-second request timeout.
