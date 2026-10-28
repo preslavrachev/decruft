@@ -46,6 +46,10 @@ images, emphasis, lists, blockquotes, code blocks, and GFM tables. The command
 adds the extracted title only when the converted content does not already begin
 with the same H1. Without `--markdown`, the command prints cleaned HTML.
 
+`--selector 'table.prices'` skips main-content scoring and outputs only the
+elements matching the CSS selector (HTML, or Markdown with `--markdown`). It
+fails when nothing matches.
+
 The CLI currently accepts one URL at a time. It does not yet parse local files,
 read HTML from standard input, emit JSON, or execute page JavaScript.
 
@@ -127,6 +131,15 @@ Use `NewWithOptions` to request a preferred document language:
 ```go
 fetcher := decruft.NewWithOptions(decruft.WithLanguage("en"))
 ```
+
+`WithSelector(css)` returns exactly the matching elements in `Result.Content`
+instead of the scored main content. No match returns `ErrSelectorNoMatch`;
+an invalid selector returns an error. Read `Result.Content` directly, since
+`BestHTML` and `BestContent` keep their 50-word floor.
+
+`WithHTTPClient(client)` sends requests through the client's transport and
+timeout. The body limit, cookie jar, and retries still apply, but the SSRF guard
+does not: the caller owns dial safety.
 
 ## How it works
 

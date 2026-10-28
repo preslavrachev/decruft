@@ -26,6 +26,8 @@ import (
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/table"
 	"github.com/PuerkitoBio/goquery"
+	"github.com/andybalholm/cascadia"
+	xhtml "golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
 )
 
@@ -45,6 +47,8 @@ var (
 	ErrResponseTooLarge = errors.New("response body too large")
 	// ErrUnsupportedMediaType reports a response known not to contain readable text.
 	ErrUnsupportedMediaType = errors.New("unsupported media type")
+	// ErrSelectorNoMatch reports that the selector given to WithSelector matched no element.
+	ErrSelectorNoMatch = errors.New("selector matched no elements")
 )
 
 type Result struct {
@@ -141,8 +145,42 @@ func WithLanguage(language string) Option {
 	}
 }
 
+// WithSelector extracts exactly the elements matching the CSS selector instead
+// of scoring the page for its main content. Page metadata is still extracted.
+// Matches are concatenated in document order into Result.Content, with no
+// clutter removal and no word-count floor; read Result.Content directly because
+// BestHTML and BestContent still require 50 words. An invalid selector is an
+// error, and no match returns ErrSelectorNoMatch. A match without text on a page
+// without a title fails with "no usable content". An empty value is ignored.
+func WithSelector(css string) Option {
+	return func(config *fetchConfig) {
+		config.selector = strings.TrimSpace(css)
+	}
+}
+
+// WithHTTPClient sends requests through the client's Transport (or
+// http.DefaultTransport when nil) and uses its Timeout when positive. The body
+// size limit, cookie jar and retries still apply, but the default SSRF guard
+// is bypassed: the caller owns dial safety, including for redirects.
+func WithHTTPClient(client *http.Client) Option {
+	return func(config *fetchConfig) {
+		if client == nil {
+			return
+		}
+		config.transport = client.Transport
+		if config.transport == nil {
+			config.transport = http.DefaultTransport
+		}
+		if client.Timeout > 0 {
+			config.timeout = client.Timeout
+		}
+	}
+}
+
 type fetchConfig struct {
 	language      string
+	selector      string
+	transport     http.RoundTripper
 	maxBodySize   int
 	maxRetries    int
 	parallelism   int
@@ -171,7 +209,11 @@ func NewWithOptions(options ...Option) *httpFetcher {
 	for _, option := range options {
 		option(&config)
 	}
-	return newHTTPFetcher(config, &http.Transport{DialContext: safeDialContext})
+	transport := config.transport
+	if transport == nil {
+		transport = &http.Transport{DialContext: safeDialContext}
+	}
+	return newHTTPFetcher(config, transport)
 }
 
 func defaultFetchConfig() fetchConfig {
@@ -309,7 +351,7 @@ func (f *httpFetcher) fetchOnce(ctx context.Context, rawURL string, result *Resu
 		attempt.retryable = isRetryableBodyReadError(err)
 		return attempt
 	}
-	if err := extractResponse(body, result, response.Request.URL); err != nil {
+	if err := extractDocument(body, result, response.Request.URL, f.config.selector); err != nil {
 		attempt.err = err
 	}
 	return attempt
@@ -438,7 +480,14 @@ func drainResponseBody(body io.Reader) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxResponseDrain))
 }
 
-func extractResponse(body []byte, result *Result, responseURL *url.URL) error {
+func extractDocument(body []byte, result *Result, responseURL *url.URL, selector string) error {
+	var matcher cascadia.Selector
+	if selector != "" {
+		var err error
+		if matcher, err = cascadia.Compile(selector); err != nil {
+			return fmt.Errorf("invalid selector %q: %v", selector, err)
+		}
+	}
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -446,6 +495,10 @@ func extractResponse(body []byte, result *Result, responseURL *url.URL) error {
 	extractMeta(doc, result)
 	baseURL := documentBaseURL(doc, responseURL)
 	result.ImageURL, _ = normalizeURL(result.ImageURL, baseURL, imageURLSchemes)
+
+	if matcher != nil {
+		return extractSelection(doc, matcher, selector, baseURL, result)
+	}
 
 	content, err := extractContentCandidate(bytes.NewReader(body), true)
 	if err != nil {
@@ -469,6 +522,43 @@ func extractResponse(body []byte, result *Result, responseURL *url.URL) error {
 	result.Content = strings.TrimSpace(contentHTML)
 	result.WordCount = content.wordCount
 	return nil
+}
+
+func extractSelection(doc *goquery.Document, matcher cascadia.Selector, selector string, baseURL *url.URL, result *Result) error {
+	matches := doc.FindMatcher(matcher)
+	if matches.Length() == 0 {
+		return fmt.Errorf("%w: %q", ErrSelectorNoMatch, selector)
+	}
+	normalizeContentURLs(matches, baseURL)
+
+	matched := make(map[*xhtml.Node]bool, len(matches.Nodes))
+	for _, node := range matches.Nodes {
+		matched[node] = true
+	}
+
+	var content strings.Builder
+	for _, node := range matches.Nodes {
+		if hasMatchedAncestor(node, matched) {
+			continue
+		}
+		if err := xhtml.Render(&content, node); err != nil {
+			return err
+		}
+	}
+	result.Content = strings.TrimSpace(content.String())
+	result.WordCount = visibleWordCount(result.Content)
+	return nil
+}
+
+// hasMatchedAncestor reports whether an ancestor of node is itself matched, so
+// its markup is already part of the ancestor's output.
+func hasMatchedAncestor(node *xhtml.Node, matched map[*xhtml.Node]bool) bool {
+	for parent := node.Parent; parent != nil; parent = parent.Parent {
+		if matched[parent] {
+			return true
+		}
+	}
+	return false
 }
 
 func finalizeResult(result *Result, originalURL, responseURL *url.URL) (*Result, error) {

@@ -14,10 +14,17 @@ import (
 )
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	return newCommand(decruft.New(), stdout, stderr).Run(ctx, args)
+	factory := func(options ...decruft.Option) decruft.Fetcher {
+		return decruft.NewWithOptions(options...)
+	}
+	return newCommandWithFactory(factory, stdout, stderr).Run(ctx, args)
 }
 
 func newCommand(fetcher decruft.Fetcher, stdout, stderr io.Writer) *cli.Command {
+	return newCommandWithFactory(func(...decruft.Option) decruft.Fetcher { return fetcher }, stdout, stderr)
+}
+
+func newCommandWithFactory(newFetcher func(...decruft.Option) decruft.Fetcher, stdout, stderr io.Writer) *cli.Command {
 	cmd := &cli.Command{
 		Name:      "decruft",
 		Usage:     "extract readable content from web pages",
@@ -34,6 +41,10 @@ func newCommand(fetcher decruft.Fetcher, stdout, stderr io.Writer) *cli.Command 
 						Aliases: []string{"md"},
 						Usage:   "format the result as Markdown",
 					},
+					&cli.StringFlag{
+						Name:  "selector",
+						Usage: "extract only the elements matching this CSS selector",
+					},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Len() != 1 {
@@ -41,7 +52,11 @@ func newCommand(fetcher decruft.Fetcher, stdout, stderr io.Writer) *cli.Command 
 					}
 
 					rawURL := cmd.Args().First()
-					result, err := fetcher.Fetch(ctx, rawURL)
+					var options []decruft.Option
+					if selector := cmd.String("selector"); selector != "" {
+						options = append(options, decruft.WithSelector(selector))
+					}
+					result, err := newFetcher(options...).Fetch(ctx, rawURL)
 					if err != nil {
 						return fmt.Errorf("extracting %s: %w", rawURL, err)
 					}
@@ -56,7 +71,7 @@ func newCommand(fetcher decruft.Fetcher, stdout, stderr io.Writer) *cli.Command 
 
 					output := body
 					if cmd.Bool("markdown") {
-						output, err = renderMarkdown(result)
+						output, err = renderMarkdown(result, cmd.String("selector") == "")
 						if err != nil {
 							return fmt.Errorf("converting output to Markdown: %w", err)
 						}
@@ -75,7 +90,7 @@ func newCommand(fetcher decruft.Fetcher, stdout, stderr io.Writer) *cli.Command 
 	return cmd
 }
 
-func renderMarkdown(result *decruft.Result) (string, error) {
+func renderMarkdown(result *decruft.Result, includeTitle bool) (string, error) {
 	contentHTML := strings.TrimSpace(result.Content)
 	if contentHTML == "" {
 		contentHTML = plainTextHTML(result.Description)
@@ -84,7 +99,7 @@ func renderMarkdown(result *decruft.Result) (string, error) {
 	}
 
 	title := strings.TrimSpace(result.Title)
-	if title != "" && !hasEquivalentH1(contentHTML, title) {
+	if includeTitle && title != "" && !hasEquivalentH1(contentHTML, title) {
 		contentHTML = "<h1>" + html.EscapeString(title) + "</h1>" + contentHTML
 	}
 

@@ -68,7 +68,7 @@ func TestExtractResponseReturnsCleanedHTMLAndNormalizesURLs(t *testing.T) {
 		t.Fatalf("parse response URL: %v", err)
 	}
 
-	if err := extractResponse(body, result, responseURL); err != nil {
+	if err := extractDocument(body, result, responseURL, ""); err != nil {
 		t.Fatalf("extract response: %v", err)
 	}
 
@@ -130,7 +130,7 @@ func TestRelaxedCandidateDrivesHTMLAndMarkdown(t *testing.T) {
 	</article></body></html>`)
 	result := &Result{}
 
-	if err := extractResponse(body, result, nil); err != nil {
+	if err := extractDocument(body, result, nil, ""); err != nil {
 		t.Fatalf("extract response: %v", err)
 	}
 	if !strings.Contains(result.Content, "RELAXEDWINNER") {

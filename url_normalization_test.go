@@ -17,7 +17,7 @@ func TestExtractResponseUsesDocumentBaseForMetadataImage(t *testing.T) {
 	responseURL := mustParseURL(t, "https://example.com/articles/post")
 	result := &Result{}
 
-	if err := extractResponse(body, result, responseURL); err != nil {
+	if err := extractDocument(body, result, responseURL, ""); err != nil {
 		t.Fatalf("extract response: %v", err)
 	}
 	if result.ImageURL != "https://example.com/assets/cover.jpg" {
