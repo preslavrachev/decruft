@@ -119,6 +119,29 @@ func TestExtractContent_RemovesOpacityHiddenElements(t *testing.T) {
 	}
 }
 
+// TestExtractContent_KeepsKiosqPaywallParagraphs checks that article paragraphs
+// hidden behind a Kiosq soft paywall are still extracted, while other
+// aria-hidden paragraphs are dropped as before.
+func TestExtractContent_KeepsKiosqPaywallParagraphs(t *testing.T) {
+	//GIVEN: an article with a Kiosq-gated paragraph and a plain aria-hidden one.
+	html := `<html><body><article>
+		<p>Real article paragraph one with enough words to be the main content.</p>
+		<p aria-hidden="true" class="kiosq-b">Gated paragraph carrying the rest of the story.</p>
+		<p aria-hidden="true">Decorative hidden text that should not appear in output.</p>
+	</article></body></html>`
+
+	//WHEN: the content is extracted.
+	content := extractContent(bytes.NewReader([]byte(html)), true)
+
+	//THEN: the Kiosq paragraph is kept and the plain aria-hidden one is removed.
+	if !strings.Contains(content, "Gated paragraph") {
+		t.Error("expected kiosq-b paragraph to be kept, but it was removed")
+	}
+	if strings.Contains(content, "Decorative hidden text") {
+		t.Error("expected plain aria-hidden paragraph to be removed, but it appeared in output")
+	}
+}
+
 // extractText only looks at <p>, then headings/li/blockquote. <pre>/<code> are
 // skipped entirely, so technical articles lose all code samples.
 func TestExtractText_IncludesCodeBlocks(t *testing.T) {

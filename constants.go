@@ -140,7 +140,8 @@ var exactSelectors = []string{
 
 	// hidden
 	"[hidden]",
-	`[aria-hidden="true"]:not([class*="math"])`,
+	// Future plc's Kiosq paywall marks real body paragraphs aria-hidden.
+	`[aria-hidden="true"]:not([class*="math"]):not(p.kiosq-b)`,
 	`[style*="display: none"]:not([class*="math"])`,
 	`[style*="display:none"]:not([class*="math"])`,
 	`[style*="visibility: hidden"]`,
